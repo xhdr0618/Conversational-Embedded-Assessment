@@ -1,41 +1,31 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+"""
+本脚本整合了间接表达生成、筛选、排序和心理医生评估的完整流程。
+"""
+
 import json
+import time
 import requests
+from typing import List, Dict, Tuple
+import numpy as np
+import sys
+from generate_indirect_expressions import generate_indirect_expressions
+from filter_expressions import select_best_expressions
+from rank import find_best_order, compute_similarity_matrix
 
+# API 配置
+API_KEY = "sk-ifwanibmtyicatvjoqjvydmddvqwggzbcwlgmqschltrcxlv"
 API_URL = "https://api.siliconflow.cn/v1/chat/completions"
-API_KEY = "sk-ifwanibmtyicatvjoqjvydmddvqwggzbcwlgmqschltrcxlv"  # 请替换为实际的 API Key
-MODEL_NAME = "deepseek-ai/DeepSeek-V3"  # 请确认使用正确的模型名称
+MODEL_NAME = "Pro/deepseek-ai/DeepSeek-V3"
 
-# 示例的测量目标－表达变体映射表（可根据实际需要扩展）
-mapping_table = {
-    "自杀意念": {
-        "核心词": ["死亡", "结束", "消失"],
-        "直接询问": ["最近有过不想活的念头吗？"],
-        "间接表达": ["你觉得未来会变好吗？", "有没有觉得累了想休息很久？"],
-        "干扰选项": ["你有考虑换工作吗？", "喜欢什么运动？"]
-    }
-    # 可在此添加其他测量目标的映射
-}
-
-def load_scale(file_path):
-    """
-    读取 SCL90 心理量表文件，并返回解析后的 JSON 数据
-    """
-    with open(file_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def send_message_to_model(messages):
-    """
-    通过 SiliconFlow deepseekr1 模型接口发送消息，并以流式方式获取回复。
-    messages 是包含对话记录的列表，每个元素为 {"role": ROLE, "content": CONTENT}。
-    返回模型回复的完整文本。
-    """
+def send_message_to_model(messages, retries=3, initial_timeout=60):
+    """调用 DeepSeek V3 API"""
     payload = {
         "model": MODEL_NAME,
         "messages": messages,
-        "stream": True
+        "stream": False
     }
     headers = {
         "accept": "application/json",
@@ -43,130 +33,356 @@ def send_message_to_model(messages):
         "authorization": f"Bearer {API_KEY}"
     }
     
-    response = requests.post(API_URL, json=payload, headers=headers, stream=True)
-    reply_text = ""
+    attempt = 0
+    while attempt < retries:
+        try:
+            wait_time = (2 ** attempt) + 1
+            if attempt > 0:
+                print(f"等待 {wait_time} 秒后重试...")
+                time.sleep(wait_time)
+            
+            response = requests.post(API_URL, json=payload, headers=headers, timeout=initial_timeout)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if "choices" in data and len(data["choices"]) > 0:
+                    return data["choices"][0]["message"]["content"].strip()
+            elif response.status_code == 429:
+                print(f"请求频率过高，正在重试...（{attempt + 1}/{retries}）")
+            else:
+                print(f"API 调用失败, 状态码：{response.status_code}")
+                
+        except requests.exceptions.Timeout:
+            print("请求超时")
+        except Exception as e:
+            print(f"请求错误：{e}")
+            
+        attempt += 1
+        time.sleep(2)  # 基础等待时间
     
-    if response.status_code == 200:
-        response.encoding = 'utf-8'
-        for line in response.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            if line.startswith("data:"):
-                line = line[5:].strip()
-            if line == "[DONE]":
-                break
-            try:
-                data = json.loads(line)
-                choices = data.get("choices", [])
-                for choice in choices:
-                    delta = choice.get("delta", {})
-                    text = delta.get("content") or delta.get("reasoning_content")
-                    if text:
-                        # 该函数同时打印并累积回复内容
-                        print(text, end='', flush=True)
-                        reply_text += text
-            except Exception:
-                continue
-    else:
-        print("请求失败，状态码：", response.status_code)
-    
-    print()  # 换行
-    return reply_text
+    return ""
 
-def dynamic_transform_question(original_question, mapping_table):
+def select_final_expression(filtered_expressions: Dict) -> Dict:
+    """从每个问题的三个最佳表达中选择一个最终表达"""
+    result = {}
+    
+    prompt_template = """
+    作为一位专业的心理咨询师，请从以下三个间接表达中选择一个最适合用于心理测评的表达。
+    这个表达应该最好地平衡了间接性和测量目标。
+
+    原始问题："{original_question}"
+
+    三个候选表达：
+    1. {expr1}
+    2. {expr2}
+    3. {expr3}
+
+    请只返回你选择的表达编号（1、2或3）。
     """
-    根据映射表对原始量表问题进行语义解构，
-    若检测到问题中包含映射表中某测量目标的“核心词”，
-    则利用动态对话生成模型将该问题转变为自然对话提问，
-    以降低重测时被试记住原题目的可能性。
-    若无匹配则返回原问题。
+    
+    for question_id, content in filtered_expressions.items():
+        original_question = content["原始问题"]
+        expressions = content["间接表达"]
+        
+        if len(expressions) < 3:
+            result[question_id] = expressions[0] if expressions else ""
+            continue
+            
+        prompt = prompt_template.format(
+            original_question=original_question,
+            expr1=expressions[0],
+            expr2=expressions[1],
+            expr3=expressions[2]
+        )
+        
+        messages = [
+            {"role": "system", "content": "你是一位专业的心理咨询师。"},
+            {"role": "user", "content": prompt}
+        ]
+        
+        response = send_message_to_model(messages)
+        try:
+            selected_index = int(response.strip()) - 1
+            if 0 <= selected_index < len(expressions):
+                result[question_id] = expressions[selected_index]
+            else:
+                result[question_id] = expressions[0]
+        except:
+            result[question_id] = expressions[0]
+        
+        time.sleep(2)  # 请求间隔
+    
+    return result
+
+def conduct_assessment(ordered_questions: List[str]) -> Tuple[List[int], List[str]]:
     """
-    # 遍历映射表，判断是否存在匹配的“核心词”
-    for target, mapping in mapping_table.items():
-        for core_word in mapping.get("核心词", []):
-            if core_word in original_question:
-                # 构造转写提示：要求模型使用映射信息改写原问题
-                prompt = (
-                    f"你是一个心理学专家，请对以下心理测评原始问题进行改写，使其更具自然对话风格，"
-                    f"同时保持对测量目标「{target}」的检测不变，避免重复测评时被试记住原题。\n\n"
-                    f"【映射表信息】\n"
-                    f"核心词：{mapping.get('核心词')}\n"
-                    f"直接询问：{mapping.get('直接询问')}\n"
-                    f"间接表达：{mapping.get('间接表达')}\n"
-                    f"干扰选项：{mapping.get('干扰选项')}\n\n"
-                    f"【原始问题】\n{original_question}\n\n"
-                    f"请生成一个改写后的对话提问，仅输出提问内容，不含额外说明。"
-                )
-                conversation = [
-                    {"role": "system", "content": "你是一个心理学专家，精通心理测评问答设计。"},
-                    {"role": "user", "content": prompt}
-                ]
-                transformed = send_message_to_model(conversation)
-                return transformed.strip()
-    # 若未匹配任何映射，则直接返回原始问题
-    return original_question
+    进行交互式心理测评，返回每个问题的得分和回答内容
+    """
+    scores = []
+    answers = []  # 记录所有回答
+    conversation_history = []
+    
+    system_prompt = """你是一位专业的心理咨询师，正在进行心理测评。
+你需要：
+1. 以温和、专业的方式提出问题
+2. 仔细倾听来访者的回答
+3. 根据回答评估一个1-5的分数，其中：
+   1分 = 完全不符合
+   2分 = 比较不符合
+   3分 = 一般
+   4分 = 比较符合
+   5分 = 完全符合"""
+
+    print("\n心理咨询师：你好，我是心理咨询师。接下来我会问你一些问题，请根据你的真实感受回答。")
+
+    for i, question in enumerate(ordered_questions, 1):
+        # 提出问题
+        question_prompt = f"""请以专业、温和的方式提出这个问题：
+
+问题内容：{question}
+
+要求：
+1. 自然地承接上文
+2. 适当添加引导语
+3. 保持问题原文不变,但不要问出问题"""
+
+        messages = conversation_history + [{"role": "user", "content": question_prompt}]
+        response = send_message_to_model(messages)
+        print(f"\n心理咨询师：{response}")
+        
+        # 获取用户回答
+        user_answer = input("\n你的回答：")
+        answers.append(user_answer)
+        
+        # 评估回答（只获取分数）
+        evaluation_prompt = f"""请根据来访者的回答，给出1-5分的评估。
+只需返回分数（1-5的整数），不需要解释。
+
+原始问题：{question}
+来访者回答：{user_answer}"""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": evaluation_prompt}
+        ]
+        score = send_message_to_model(messages)
+        
+        try:
+            score = int(score.strip())
+            if 1 <= score <= 5:
+                scores.append(score)
+            else:
+                scores.append(3)
+        except:
+            scores.append(3)
+        
+        print(f"\n得分：{scores[-1]}")
+        print("-" * 30)
+        
+        time.sleep(1)
+
+    return scores, answers
+
+def calculate_total_score(scores: List[int]) -> Dict:
+    """计算总分和统计信息"""
+    total = sum(scores)
+    avg = total / len(scores)
+    max_possible = len(scores) * 5
+    percentage = (total / max_possible) * 100
+    
+    return {
+        "总分": total,
+        "平均分": round(avg, 2),
+        "题目数": len(scores),
+        "最高可能分": max_possible,
+        "得分率": round(percentage, 2)
+    }
+
+def display_ordered_questions(ordered_questions: List[str], original_order: Dict[str, str] = None):
+    """
+    展示优化后的问题顺序
+    
+    参数:
+        ordered_questions: 优化排序后的问题列表
+        original_order: 原始问题字典（可选）
+    """
+    print("\n优化后的问题顺序：")
+    print("=" * 80)
+    
+    for i, question in enumerate(ordered_questions, 1):
+        # 如果提供了原始顺序，尝试找出这个问题在原始顺序中的编号
+        original_number = ""
+        if original_order:
+            for num, q in original_order.items():
+                if q == question:
+                    original_number = f"(原题号: {num})"
+                    break
+        
+        print(f"\n{i}. {question} {original_number}")
+    
+    print("\n" + "=" * 80)
+    input("\n请检查问题顺序，按回车键继续...")
+
+def generate_analysis_prompt(questions, answers, scores, results):
+    """生成分析报告的prompt"""
+    # 使用普通字符串连接而不是f-string
+    prompt = """作为心理咨询师，请根据以下测评结果生成一份专业的分析报告：
+
+测评情况：
+"""
+    
+    # 添加问题和回答信息
+    for i, (q, a, s) in enumerate(zip(questions, answers, scores)):
+        prompt += f"问题{i+1}: {q}\n回答: {a}\n得分: {s}\n"
+    
+    # 添加结果信息
+    prompt += "\n总体得分：\n"
+    for key, value in results.items():
+        prompt += f"{key}: {value}\n"
+    
+    prompt += """
+请从以下方面进行分析：
+1. 总体心理状态评估
+2. 主要表现特征
+3. 需要重点关注的方面
+4. 改善建议
+
+请用专业且温和的语言撰写。"""
+    
+    return prompt
 
 def main():
-    # 读取 SCL90心理量表文件（请确认文件路径正确）
-    scale_file = r"D:\desk\MICCAI\llm\SCL90.json"
-    scale_data = load_scale(scale_file)
+    # 文件路径
+    original_file = r"scales\一般心理健康与行为问题\SCL_90.json"
+    indirect_file = "indirect_expressions_main.json"
+    filtered_file = "filtered_expressions_main.json"
+
     
-    # 从文件中获取问题，问题存放在 "contents" -> "items" 下（key 为 "1"~"90" 的字符串）
-    items = scale_data.get("contents", {}).get("items", {})
-    questions = []
-    # 根据题号数字顺序整理出 90 个问题
-    for key in sorted(items.keys(), key=lambda x: int(x)):
-        questions.append(items[key])
+    # 1. 生成间接表达
+    print("正在生成间接表达...")
+    # 加载原始量表数据
+    questions = load_questionnaire(original_file)  # 使用 dialogue_path.py 中的函数
     
-    num_questions = len(questions)
-    if num_questions != 90:
-        print(f"警告：量表问题数量为 {num_questions} 个，原始 SCL90 应包含 90 个问题。")
+    # 将问题列表转换为所需的字典格式
+    questions_dict = {
+        str(i+1): question 
+        for i, question in enumerate(questions)
+    }
     
-    # 量表基本信息及说明（可根据实际文件内容调整）
-    title = "SCL90心理量表"
-    description = ("本量表用于评估个体的心理健康状况，涵盖躯体化、强迫症状、人际关系敏感、"
-                   "抑郁、焦虑、敌对、恐怖、偏执、精神病性以及其它（睡眠及饮食情况）等多个维度。")
-    
-    print(f"欢迎参加《{title}》心理测评，该量表共包含 {num_questions} 个问题。")
-    print("系统会对原有静态问题进行智能改写形成动态对话提问以降低重复测评效应。")
-    print("请按提示逐题作答，每题答案回车确认。全部回答完毕后，系统将自动提交您的回答进行评分。")
-    
-    responses = []
-    # 逐题提问：对每一道题先尝试用动态对话改写再提问
-    for idx, question in enumerate(questions, start=1):
-        # 对原始问题做动态转换（若与映射表匹配，则生成新提问，否则返回原题）
-        dynamic_question = dynamic_transform_question(question, mapping_table)
-        
-        print(f"\n测评师（第{idx}题）：{dynamic_question}")
-        answer = input("你的回答：").strip()
-        responses.append({
+    # 生成间接表达
+    indirect_expressions = {}
+    for qid, question in questions_dict.items():
+        expressions = generate_indirect_expressions(question)  # 生成该问题的间接表达
+        indirect_expressions[qid] = {
             "原始问题": question,
-            "动态提问": dynamic_question,
-            "答案": answer
-        })
+            "间接表达": expressions
+        }
     
-    print("\n您已完成所有题目的回答，正在生成测评报告，请稍候...\n")
+    # 保存间接表达
+    with open(indirect_file, "w", encoding="utf-8") as f:
+        json.dump(indirect_expressions, f, ensure_ascii=False, indent=2)
     
-    # 整理所有问答记录，生成最终评测文本（此处可选择记录原始或动态问题）
-    evaluation_text = f"《{title}》问答记录：\n描述：{description}\n\n"
-    for i, entry in enumerate(responses, start=1):
-        evaluation_text += (f"第{i}题（原始）：{entry['原始问题']}\n"
-                            f"改写后提问：{entry['动态提问']}\n"
-                            f"答案：{entry['答案']}\n\n")
+    # 2. 筛选最佳表达
+    print("\n正在筛选最佳表达...")
+    filtered_expressions = select_best_expressions(indirect_expressions)
+    with open(filtered_file, "w", encoding="utf-8") as f:
+        json.dump(filtered_expressions, f, ensure_ascii=False, indent=2)
     
-    # 构造最终提示，要求大模型根据 SCL90评分规则计算总分及各维度得分并给出专业评析
-    final_system_prompt = (
-        "请根据以下 SCL90心理测评问答记录，依照该量表评分规则计算出总分以及各维度（躯体化、强迫症状、人际关系敏感、"
-        "抑郁、焦虑、敌对、恐怖、偏执、精神病性、其他）的得分，并给出详细的专业评析和建议。请仅输出测评结果，不输出额外信息。"
-    )
+    # 3. 选择最终表达
+    print("\n正在选择最终表达...")
+    final_expressions = select_final_expression(filtered_expressions)
     
-    conversation_history = [
-        {"role": "user", "content": evaluation_text},
-        {"role": "system", "content": final_system_prompt}
+    # 4. 问题排序
+    print("\n正在优化问题顺序...")
+    questions = list(final_expressions.values())
+    sim_matrix = compute_similarity_matrix(questions)
+    best_order, _ = find_best_order(questions)
+    ordered_questions = [questions[i] for i in best_order]
+    
+    # 展示优化后的问题顺序
+    display_ordered_questions(ordered_questions, final_expressions)
+    
+    # 5. 进行交互式测评
+    print("\n开始进行心理测评...")
+    scores, answers = conduct_assessment(ordered_questions)
+    
+    # 6. 计算结果并生成分析报告
+    results = calculate_total_score(scores)
+    print("\n测评完成！")
+    print("\n量表得分：")
+    for key, value in results.items():
+        print(f"{key}: {value}")
+    
+    print("\n正在生成分析报告...")
+    analysis_prompt = generate_analysis_prompt(questions, answers, scores, results)
+    
+    messages = [
+        {"role": "system", "content": "你是一位专业的心理咨询师。"},
+        {"role": "user", "content": analysis_prompt}
     ]
     
-    print("测评报告：", end='')
-    send_message_to_model(conversation_history)
+    analysis = send_message_to_model(messages)
+    
+    # 7. 保存结果
+    assessment_results = {
+        "问题顺序": ordered_questions,
+        "回答记录": answers,
+        "得分": scores,
+        "统计结果": results,
+        "分析报告": analysis
+    }
+    
+    with open("assessment_results.json", "w", encoding="utf-8") as f:
+        json.dump(assessment_results, f, ensure_ascii=False, indent=2)
+    
+    print("\n测评结果已保存到 assessment_results.json")
+
+def load_questionnaire(file_path):
+    """从 JSON 文件加载问题列表"""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        items = data.get("contents", {}).get("items", {})
+        questions = [items[key] for key in sorted(items, key=lambda key: int(key))]
+        return questions
+    except Exception as e:
+        print(f"加载问卷文件时出错: {e}")
+        return []
+
+def generate_indirect_expressions(question: str) -> List[str]:
+    """为单个问题生成间接表达"""
+    prompt = f"""
+你是一位心理评估专家。请为以下心理测评问题生成5个间接表达。
+
+要求：
+1. 每个表达要简洁、含蓄，但要反映原始问题的测量目标；
+2. 严格按以下JSON格式返回：
+{{
+  "间接表达": [
+    "表达1",
+    "表达2",
+    "表达3",
+    "表达4",
+    "表达5"
+  ]
+}}
+请不要返回任何额外内容。
+
+[原始问题]: {question}
+"""
+    
+    messages = [
+        {"role": "system", "content": "你是一位专业的心理评估专家。"},
+        {"role": "user", "content": prompt}
+    ]
+    
+    response = send_message_to_model(messages)
+    try:
+        result = json.loads(response)
+        return result["间接表达"]
+    except:
+        print(f"解析间接表达失败，问题：{question}")
+        return [""] * 5  # 返回5个空字符串作为默认值
 
 if __name__ == "__main__":
     main()
